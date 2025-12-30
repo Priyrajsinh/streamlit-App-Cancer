@@ -3,3 +3,4 @@ numpy>=1.26.0
 matplotlib>=3.8.0
 pandas
 scikit-learn
+plotly>=5.18.0
