@@ -5,6 +5,14 @@ import plotly.graph_objects as go
 import numpy as np
 import re
 import io
+import json
+import base64
+
+try:
+    import google.generativeai as genai
+    HAS_GEMINI = True
+except ImportError:
+    HAS_GEMINI = False
 
 try:
     import pdfplumber
@@ -18,6 +26,8 @@ try:
 except ImportError:
     HAS_PYPDF = False
 
+
+# ── constants ──────────────────────────────────────────────────────────────────
 
 SLIDER_LABELS = [
     ("Radius (mean)",             "radius_mean"),
@@ -66,9 +76,10 @@ FEATURE_MAP = {
     "symmetry":          "symmetry",
     "fractal dimension": "fractal_dimension",
 }
-
 FLOAT_RE = re.compile(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?")
 
+
+# ── data ───────────────────────────────────────────────────────────────────────
 
 @st.cache_data
 def get_clean_data():
@@ -78,34 +89,70 @@ def get_clean_data():
     return data
 
 
-def extract_text_from_pdf(file_bytes: bytes):
-    """Returns (text, method_used)"""
+# ── PDF text extraction ────────────────────────────────────────────────────────
+
+def extract_text_from_pdf(file_bytes: bytes) -> str:
+    text = ""
     if HAS_PDFPLUMBER:
         try:
-            text = ""
             with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
                 for page in pdf.pages:
                     text += (page.extract_text() or "") + "\n"
             if text.strip():
-                return text, "pdfplumber"
-        except Exception as e:
+                return text
+        except Exception:
             pass
-
     if HAS_PYPDF:
         try:
-            text = ""
             reader = PdfReader(io.BytesIO(file_bytes))
             for page in reader.pages:
                 text += (page.extract_text() or "") + "\n"
-            if text.strip():
-                return text, "pypdf"
-        except Exception as e:
+        except Exception:
             pass
+    return text
 
-    return "", "none"
+
+# ── Gemini extraction (free AI) ────────────────────────────────────────────────
+
+GEMINI_PROMPT = """You are a medical data extraction assistant.
+Extract the following 30 breast cancer FNA (Fine Needle Aspirate) measurements from this lab report.
+Return ONLY a valid JSON object with exactly these keys and numeric float values.
+If a value is not found, use null.
+
+Required keys:
+radius_mean, texture_mean, perimeter_mean, area_mean, smoothness_mean,
+compactness_mean, concavity_mean, concave points_mean, symmetry_mean, fractal_dimension_mean,
+radius_se, texture_se, perimeter_se, area_se, smoothness_se,
+compactness_se, concavity_se, concave points_se, symmetry_se, fractal_dimension_se,
+radius_worst, texture_worst, perimeter_worst, area_worst, smoothness_worst,
+compactness_worst, concavity_worst, concave points_worst, symmetry_worst, fractal_dimension_worst
+
+Return ONLY the JSON. No explanation. No markdown. No code blocks.
+Example: {"radius_mean": 14.5, "texture_mean": 19.2, ...}
+"""
+
+def extract_with_gemini(file_bytes: bytes, api_key: str) -> dict:
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel("gemini-1.5-flash")
+
+    b64 = base64.standard_b64encode(file_bytes).decode()
+    response = model.generate_content([
+        {"mime_type": "application/pdf", "data": b64},
+        GEMINI_PROMPT,
+    ])
+
+    raw = response.text.strip()
+    # Strip markdown fences if present
+    if raw.startswith("```"):
+        raw = re.sub(r"^```[a-z]*\n?", "", raw)
+        raw = re.sub(r"\n?```$", "", raw)
+
+    return json.loads(raw.strip())
 
 
-def parse_measurements(text: str) -> dict:
+# ── fallback rule-based parser ─────────────────────────────────────────────────
+
+def parse_measurements_from_text(text: str) -> dict:
     extracted = {}
     for line in text.splitlines():
         line_low = line.strip().lower()
@@ -119,6 +166,8 @@ def parse_measurements(text: str) -> dict:
                 break
     return extracted
 
+
+# ── chart & prediction ─────────────────────────────────────────────────────────
 
 def get_scaled_values(input_dict):
     data = get_clean_data()
@@ -151,9 +200,7 @@ def get_radar_chart(input_data):
     for label, keys in groups.items():
         fig.add_trace(go.Scatterpolar(
             r=[scaled[k] for k in keys],
-            theta=categories,
-            fill="toself",
-            name=label,
+            theta=categories, fill="toself", name=label,
         ))
     fig.update_layout(
         polar=dict(radialaxis=dict(visible=True, range=[0, 1])),
@@ -188,13 +235,13 @@ def add_sidebar(prefill=None):
     for label, key in SLIDER_LABELS:
         default = float(prefill[key]) if (prefill and prefill.get(key) is not None) else float(data[key].mean())
         input_dict[key] = st.sidebar.slider(
-            label,
-            min_value=float(0),
-            max_value=float(data[key].max()),
-            value=default,
+            label, min_value=float(0),
+            max_value=float(data[key].max()), value=default,
         )
     return input_dict
 
+
+# ── main ───────────────────────────────────────────────────────────────────────
 
 def main():
     st.set_page_config(
@@ -203,67 +250,97 @@ def main():
         layout="wide",
         initial_sidebar_state="expanded",
     )
-
     with open("assests/style.css") as f:
         st.markdown(f"<style>{f.read()}</style>", unsafe_allow_html=True)
 
     st.title("Breast Cancer Predictor")
     st.write(
         "Upload your cytology lab report (PDF) and the app will automatically "
-        "extract measurements and predict whether the cell mass is benign or malignant. "
-        "You can also adjust values manually using the sidebar sliders."
+        "extract measurements and predict whether the cell mass is benign or malignant."
     )
+
+    # ── Gemini API key input ───────────────────────────────────────────────────
+    with st.expander("🔑 Set up Free AI Extraction (Google Gemini — 100% Free)"):
+        st.markdown("""
+**Get your free Gemini API key in 1 minute:**
+1. Go to [aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey)
+2. Sign in with any Google account
+3. Click **"Create API Key"** → Copy it
+4. Paste it below — no credit card, no payment ever required
+
+*Key is only stored in your browser session and never saved anywhere.*
+        """)
+        gemini_key = st.text_input(
+            "Gemini API Key",
+            type="password",
+            placeholder="AIza...",
+            help="Free forever — 15 requests/min, no credit card needed",
+        )
 
     st.subheader("📄 Upload Lab Report (PDF)")
     uploaded_file = st.file_uploader(
-        "Upload a cytology PDF report",
+        "Upload any cytology PDF report from any lab",
         type=["pdf"],
-        help="No API key required — the app reads the PDF directly.",
+        help="Works with any lab format when Gemini key is provided.",
     )
 
     extracted_values = None
 
     if uploaded_file is not None:
         file_bytes = uploaded_file.read()
-        with st.spinner("📖 Reading your report..."):
+
+        with st.spinner("📖 Extracting measurements from report..."):
             try:
-                text, method = extract_text_from_pdf(file_bytes)
+                method_used = ""
 
-                # ── DEBUG expander — shows raw extracted text ──────────────
-                with st.expander("🔍 Debug: raw text extracted from PDF"):
-                    st.write(f"**Parser used:** `{method}`")
-                    st.write(f"**pdfplumber available:** `{HAS_PDFPLUMBER}`")
-                    st.write(f"**pypdf available:** `{HAS_PYPDF}`")
-                    st.write(f"**Total characters extracted:** `{len(text)}`")
-                    st.text(text[:3000] if text else "⚠️ No text extracted at all")
-                # ─────────────────────────────────────────────────────────────
+                # ── Try Gemini first (handles ANY PDF format) ──────────────
+                if gemini_key and gemini_key.strip().startswith("AIza") and HAS_GEMINI:
+                    try:
+                        result = extract_with_gemini(file_bytes, gemini_key.strip())
+                        extracted_values = {
+                            k: float(v) for k, v in result.items()
+                            if v is not None and k in ALL_KEYS
+                        }
+                        method_used = "Gemini AI"
+                    except Exception as e:
+                        st.warning(f"⚠️ Gemini extraction failed ({e}), trying text parser...")
 
-                extracted_values = parse_measurements(text)
-                missing = [k for k in ALL_KEYS if k not in extracted_values]
-                found   = len(ALL_KEYS) - len(missing)
+                # ── Fallback: plain text rule-based parser ─────────────────
+                if not extracted_values:
+                    text = extract_text_from_pdf(file_bytes)
+                    if text.strip():
+                        extracted_values = parse_measurements_from_text(text)
+                        method_used = "text parser"
 
-                if found == len(ALL_KEYS):
-                    st.success("✅ All 30 measurements extracted successfully!")
-                elif found > 0:
-                    st.warning(
-                        f"⚠️ Extracted {found}/30 measurements. "
-                        f"Missing: {', '.join(missing)}"
-                    )
+                # ── Report result ──────────────────────────────────────────
+                if extracted_values:
+                    missing = [k for k in ALL_KEYS if k not in extracted_values]
+                    found   = len(ALL_KEYS) - len(missing)
+
+                    if found == len(ALL_KEYS):
+                        st.success(f"✅ All 30 measurements extracted successfully! *(via {method_used})*")
+                    elif found > 0:
+                        st.warning(
+                            f"⚠️ Extracted {found}/30 via {method_used}. "
+                            f"Missing: {', '.join(missing)} — using dataset averages."
+                        )
+                    else:
+                        extracted_values = None
+                        st.error("❌ Could not extract measurements.")
+
+                    if extracted_values:
+                        data = get_clean_data()
+                        for k in [k for k in ALL_KEYS if k not in extracted_values]:
+                            extracted_values[k] = float(data[k].mean())
                 else:
                     st.error(
-                        "❌ Could not read measurements. "
-                        "Please expand the Debug section above and share a screenshot — that will help fix the issue."
+                        "❌ Could not extract measurements from this PDF.\n\n"
+                        "**To fix this:** Add your free Gemini API key above — it can read "
+                        "any lab report regardless of format."
                     )
-                    extracted_values = None
-
-                if extracted_values is not None:
-                    data = get_clean_data()
-                    for k in missing:
-                        extracted_values[k] = float(data[k].mean())
 
             except Exception as e:
-                st.error(f"❌ Error: {e}")
-                extracted_values = None
+                st.error(f"❌ Unexpected error: {e}")
 
     input_data = add_sidebar(prefill=extracted_values)
 
