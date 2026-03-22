@@ -133,7 +133,7 @@ Example: {"radius_mean": 14.5, "texture_mean": 19.2, ...}
 
 def extract_with_gemini(file_bytes: bytes, api_key: str) -> dict:
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemini-1.5-flash")
+    model = genai.GenerativeModel("gemini-2.0-flash")
 
     b64 = base64.standard_b64encode(file_bytes).decode()
     response = model.generate_content([
