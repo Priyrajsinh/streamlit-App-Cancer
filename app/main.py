@@ -3,48 +3,64 @@ import pickle as pkl
 import pandas as pd
 import plotly.graph_objects as go
 import numpy as np
-import anthropic
-import base64
-import json
+import pdfplumber
+import re
+import io
 
 
-# ── helpers ────────────────────────────────────────────────────────────────────
+# ── constants ──────────────────────────────────────────────────────────────────
 
 SLIDER_LABELS = [
-    ("Radius (mean)",              "radius_mean"),
-    ("Texture (mean)",             "texture_mean"),
-    ("Perimeter (mean)",           "perimeter_mean"),
-    ("Area (mean)",                "area_mean"),
-    ("Smoothness (mean)",          "smoothness_mean"),
-    ("Compactness (mean)",         "compactness_mean"),
-    ("Concavity (mean)",           "concavity_mean"),
-    ("Concave points (mean)",      "concave points_mean"),
-    ("Symmetry (mean)",            "symmetry_mean"),
-    ("Fractal dimension (mean)",   "fractal_dimension_mean"),
-    ("Radius (se)",                "radius_se"),
-    ("Texture (se)",               "texture_se"),
-    ("Perimeter (se)",             "perimeter_se"),
-    ("Area (se)",                  "area_se"),
-    ("Smoothness (se)",            "smoothness_se"),
-    ("Compactness (se)",           "compactness_se"),
-    ("Concavity (se)",             "concavity_se"),
-    ("Concave points (se)",        "concave points_se"),
-    ("Symmetry (se)",              "symmetry_se"),
-    ("Fractal dimension (se)",     "fractal_dimension_se"),
-    ("Radius (worst)",             "radius_worst"),
-    ("Texture (worst)",            "texture_worst"),
-    ("Perimeter (worst)",          "perimeter_worst"),
-    ("Area (worst)",               "area_worst"),
-    ("Smoothness (worst)",         "smoothness_worst"),
-    ("Compactness (worst)",        "compactness_worst"),
-    ("Concavity (worst)",          "concavity_worst"),
-    ("Concave points (worst)",     "concave points_worst"),
-    ("Symmetry (worst)",           "symmetry_worst"),
-    ("Fractal dimension (worst)",  "fractal_dimension_worst"),
+    ("Radius (mean)",             "radius_mean"),
+    ("Texture (mean)",            "texture_mean"),
+    ("Perimeter (mean)",          "perimeter_mean"),
+    ("Area (mean)",               "area_mean"),
+    ("Smoothness (mean)",         "smoothness_mean"),
+    ("Compactness (mean)",        "compactness_mean"),
+    ("Concavity (mean)",          "concavity_mean"),
+    ("Concave points (mean)",     "concave points_mean"),
+    ("Symmetry (mean)",           "symmetry_mean"),
+    ("Fractal dimension (mean)",  "fractal_dimension_mean"),
+    ("Radius (se)",               "radius_se"),
+    ("Texture (se)",              "texture_se"),
+    ("Perimeter (se)",            "perimeter_se"),
+    ("Area (se)",                 "area_se"),
+    ("Smoothness (se)",           "smoothness_se"),
+    ("Compactness (se)",          "compactness_se"),
+    ("Concavity (se)",            "concavity_se"),
+    ("Concave points (se)",       "concave points_se"),
+    ("Symmetry (se)",             "symmetry_se"),
+    ("Fractal dimension (se)",    "fractal_dimension_se"),
+    ("Radius (worst)",            "radius_worst"),
+    ("Texture (worst)",           "texture_worst"),
+    ("Perimeter (worst)",         "perimeter_worst"),
+    ("Area (worst)",              "area_worst"),
+    ("Smoothness (worst)",        "smoothness_worst"),
+    ("Compactness (worst)",       "compactness_worst"),
+    ("Concavity (worst)",         "concavity_worst"),
+    ("Concave points (worst)",    "concave points_worst"),
+    ("Symmetry (worst)",          "symmetry_worst"),
+    ("Fractal dimension (worst)", "fractal_dimension_worst"),
 ]
 
 ALL_KEYS = [k for _, k in SLIDER_LABELS]
 
+# Map readable feature names (as they appear in the PDF table) to key prefixes
+FEATURE_MAP = {
+    "radius":            "radius",
+    "texture":           "texture",
+    "perimeter":         "perimeter",
+    "area":              "area",
+    "smoothness":        "smoothness",
+    "compactness":       "compactness",
+    "concavity":         "concavity",
+    "concave points":    "concave points",
+    "symmetry":          "symmetry",
+    "fractal dimension": "fractal_dimension",
+}
+
+
+# ── data helpers ───────────────────────────────────────────────────────────────
 
 @st.cache_data
 def get_clean_data():
@@ -54,58 +70,96 @@ def get_clean_data():
     return data
 
 
-def extract_measurements_with_claude(file_bytes: bytes, mime_type: str) -> dict:
-    """Send the uploaded file to Claude and get back a dict of measurements."""
-    client = anthropic.Anthropic()   # reads ANTHROPIC_API_KEY from env
+# ── PDF parsing (free, no API) ─────────────────────────────────────────────────
 
-    b64 = base64.standard_b64encode(file_bytes).decode()
+def extract_measurements_from_pdf(file_bytes: bytes) -> dict:
+    """
+    Parse all 30 FNA measurements directly from a PDF using pdfplumber.
+    Works with the standard report format generated for this app.
+    """
+    extracted = {}
 
-    field_list = json.dumps(ALL_KEYS, indent=2)
-    prompt = (
-        "You are analysing a breast-cancer fine-needle aspirate (FNA) cytology "
-        "lab report. Extract the numeric values for the following 30 features and "
-        "return ONLY a single valid JSON object - no markdown, no explanation.\n\n"
-        f"Required fields:\n{field_list}\n\n"
-        "Rules:\n"
-        "- All values must be numbers (float). Use null if a value is genuinely "
-        "absent.\n"
-        "- Field names must match exactly (including spaces and underscores).\n"
-        "- Do not add any extra keys.\n"
-        "Return format example (truncated):\n"
-        '{"radius_mean": 14.5, "texture_mean": 19.2, ...}'
-    )
+    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+        full_text = ""
+        all_tables = []
+        for page in pdf.pages:
+            full_text += (page.extract_text() or "") + "\n"
+            tables = page.extract_tables()
+            if tables:
+                all_tables.extend(tables)
 
-    if mime_type == "application/pdf":
-        file_block = {
-            "type": "document",
-            "source": {"type": "base64", "media_type": "application/pdf", "data": b64},
-        }
-    else:
-        file_block = {
-            "type": "image",
-            "source": {"type": "base64", "media_type": mime_type, "data": b64},
-        }
+    # ── Strategy 1: parse structured table rows ────────────────────────────
+    # Expected row format: ["Radius", "13.54000", "0.26990", "15.11000"]
+    number_re = re.compile(r"^\d+(\.\d+)?$")
 
-    message = client.messages.create(
-        model="claude-opus-4-6",
-        max_tokens=1024,
-        messages=[
-            {
-                "role": "user",
-                "content": [file_block, {"type": "text", "text": prompt}],
-            }
-        ],
-    )
+    for table in all_tables:
+        for row in table:
+            if not row or len(row) < 4:
+                continue
+            # Clean cells
+            cells = [str(c).strip().lower() if c else "" for c in row]
+            feature_name = cells[0]
 
-    raw = message.content[0].text.strip()
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-    return json.loads(raw)
+            # Match feature name
+            matched_key = None
+            for fname, fkey in FEATURE_MAP.items():
+                if fname in feature_name:
+                    matched_key = fkey
+                    break
+            if not matched_key:
+                continue
+
+            # Extract the three numeric columns (mean, se, worst)
+            nums = []
+            for cell in cells[1:]:
+                cell_clean = cell.replace(",", ".")
+                if number_re.match(cell_clean):
+                    nums.append(float(cell_clean))
+                elif re.match(r"^\d+(\.\d+)?$", cell_clean):
+                    nums.append(float(cell_clean))
+
+            if len(nums) >= 3:
+                extracted[f"{matched_key}_mean"]  = nums[0]
+                extracted[f"{matched_key}_se"]    = nums[1]
+                extracted[f"{matched_key}_worst"] = nums[2]
+
+    # ── Strategy 2: regex scan of raw text for key: value pairs ───────────
+    # Handles formats like "radius_mean: 13.54" or "radius_mean = 13.54"
+    if len(extracted) < 10:
+        for key in ALL_KEYS:
+            pattern = re.compile(
+                rf"{re.escape(key)}\s*[=:]\s*([0-9]+(?:\.[0-9]+)?)",
+                re.IGNORECASE,
+            )
+            m = pattern.search(full_text)
+            if m and key not in extracted:
+                extracted[key] = float(m.group(1))
+
+    # ── Strategy 3: scan for lines with "feature ... num num num" ─────────
+    if len(extracted) < 10:
+        lines = full_text.splitlines()
+        float_re = re.compile(r"\d+\.\d{3,}")
+        for line in lines:
+            line_low = line.lower()
+            matched_key = None
+            for fname, fkey in FEATURE_MAP.items():
+                if fname in line_low:
+                    matched_key = fkey
+                    break
+            if not matched_key:
+                continue
+            nums = [float(x) for x in float_re.findall(line)]
+            if len(nums) >= 3 and f"{matched_key}_mean" not in extracted:
+                extracted[f"{matched_key}_mean"]  = nums[0]
+                extracted[f"{matched_key}_se"]    = nums[1]
+                extracted[f"{matched_key}_worst"] = nums[2]
+
+    return extracted
 
 
-def get_scaled_values(input_dict: dict) -> dict:
+# ── chart & prediction ─────────────────────────────────────────────────────────
+
+def get_scaled_values(input_dict):
     data = get_clean_data()
     X = data.drop(["diagnosis"], axis=1)
     scaled = {}
@@ -116,15 +170,10 @@ def get_scaled_values(input_dict: dict) -> dict:
     return scaled
 
 
-def get_radar_chart(input_data: dict):
+def get_radar_chart(input_data):
     input_data = get_scaled_values(input_data)
-    categories = [
-        "Radius", "Texture", "Perimeter", "Area",
-        "Smoothness", "Compactness", "Concavity",
-        "Concave Points", "Symmetry", "Fractal Dimension",
-    ]
-
-    fig = go.Figure()
+    categories = ["Radius","Texture","Perimeter","Area","Smoothness",
+                  "Compactness","Concavity","Concave Points","Symmetry","Fractal Dimension"]
     suffixes = {
         "mean":  ["radius_mean","texture_mean","perimeter_mean","area_mean",
                   "smoothness_mean","compactness_mean","concavity_mean",
@@ -136,15 +185,12 @@ def get_radar_chart(input_data: dict):
                   "smoothness_worst","compactness_worst","concavity_worst",
                   "concave points_worst","symmetry_worst","fractal_dimension_worst"],
     }
-    groups = [("mean", "Mean Value"), ("se", "Standard Error"), ("worst", "Worst Value")]
-    for group, label in groups:
+    fig = go.Figure()
+    for group, label in [("mean","Mean Value"),("se","Standard Error"),("worst","Worst Value")]:
         fig.add_trace(go.Scatterpolar(
             r=[input_data[k] for k in suffixes[group]],
-            theta=categories,
-            fill="toself",
-            name=label,
+            theta=categories, fill="toself", name=label,
         ))
-
     fig.update_layout(
         polar=dict(radialaxis=dict(visible=True, range=[0, 1])),
         showlegend=True,
@@ -152,7 +198,7 @@ def get_radar_chart(input_data: dict):
     return fig
 
 
-def add_predictions(input_data: dict):
+def add_predictions(input_data):
     model  = pkl.load(open("model/model.pkl",  "rb"))
     scaler = pkl.load(open("model/scaler.pkl", "rb"))
 
@@ -171,17 +217,15 @@ def add_predictions(input_data: dict):
 
     st.write(f"**Probability of Benign:** {proba[0]:.3f}")
     st.write(f"**Probability of Malignant:** {proba[1]:.3f}")
-    st.info(
-        "This app assists medical professionals in making a diagnosis "
-        "but should not replace professional medical advice."
-    )
+    st.info("This app assists medical professionals in making a diagnosis but should not replace professional medical advice.")
 
 
-def add_sidebar(prefill=None) -> dict:
+# ── sidebar ────────────────────────────────────────────────────────────────────
+
+def add_sidebar(prefill=None):
     st.sidebar.header("Cell Nuclei Measurements")
     data = get_clean_data()
     input_dict = {}
-
     for label, key in SLIDER_LABELS:
         default = float(prefill[key]) if (prefill and prefill.get(key) is not None) else float(data[key].mean())
         input_dict[key] = st.sidebar.slider(
@@ -192,6 +236,8 @@ def add_sidebar(prefill=None) -> dict:
         )
     return input_dict
 
+
+# ── main ───────────────────────────────────────────────────────────────────────
 
 def main():
     st.set_page_config(
@@ -206,66 +252,60 @@ def main():
 
     st.title("Breast Cancer Predictor")
     st.write(
-        "Upload your cytology lab report (PDF or image) and the app will "
-        "automatically extract measurements and predict whether the cell mass "
-        "is benign or malignant. You can also fine-tune values with the sidebar sliders."
+        "Upload your cytology lab report (PDF) and the app will automatically "
+        "extract the measurements and predict whether the cell mass is benign or malignant. "
+        "You can also adjust values manually using the sidebar sliders."
     )
 
-    st.subheader("📄 Upload Lab Report")
+    # ── Upload section ─────────────────────────────────────────────────────
+    st.subheader("📄 Upload Lab Report (PDF)")
     uploaded_file = st.file_uploader(
-        "Upload a cytology report (PDF, PNG, JPG, JPEG)",
-        type=["pdf", "png", "jpg", "jpeg"],
-        help="The AI will read the report and fill in all 30 measurements automatically.",
+        "Upload a cytology PDF report",
+        type=["pdf"],
+        help="The app will read the PDF and fill in all 30 measurements automatically — no API key required.",
     )
 
     extracted_values = None
 
     if uploaded_file is not None:
-        mime_map = {
-            "pdf":  "application/pdf",
-            "png":  "image/png",
-            "jpg":  "image/jpeg",
-            "jpeg": "image/jpeg",
-        }
-        ext        = uploaded_file.name.rsplit(".", 1)[-1].lower()
-        mime       = mime_map.get(ext, "image/jpeg")
         file_bytes = uploaded_file.read()
-
-        with st.spinner("🔍 Analysing your report with AI..."):
+        with st.spinner("📖 Reading your report..."):
             try:
-                extracted_values = extract_measurements_with_claude(file_bytes, mime)
+                extracted_values = extract_measurements_from_pdf(file_bytes)
 
-                missing = [k for k in ALL_KEYS if extracted_values.get(k) is None]
+                missing = [k for k in ALL_KEYS if k not in extracted_values]
                 found   = len(ALL_KEYS) - len(missing)
 
                 if found == len(ALL_KEYS):
-                    st.success("✅ All 30 measurements extracted successfully!")
-                else:
+                    st.success(f"✅ All 30 measurements extracted successfully!")
+                elif found > 0:
                     st.warning(
                         f"⚠️ Extracted {found}/30 measurements. "
-                        f"Missing fields will use dataset averages: "
-                        f"{', '.join(missing)}"
+                        f"Missing values will use dataset averages: {', '.join(missing)}"
                     )
+                else:
+                    st.error(
+                        "❌ Could not extract measurements. "
+                        "Make sure the PDF has a measurements table with Feature / Mean / SE / Worst columns."
+                    )
+                    extracted_values = None
 
-                data = get_clean_data()
-                for k in missing:
-                    extracted_values[k] = float(data[k].mean())
+                # Fill missing with dataset means
+                if extracted_values is not None:
+                    data = get_clean_data()
+                    for k in missing:
+                        extracted_values[k] = float(data[k].mean())
 
-            except json.JSONDecodeError:
-                st.error("❌ Could not parse measurements from the report. Please try a clearer image or adjust sliders manually.")
-                extracted_values = None
             except Exception as e:
-                st.error(f"❌ Error analysing report: {e}")
+                st.error(f"❌ Error reading report: {e}")
                 extracted_values = None
 
+    # ── Sliders & chart ────────────────────────────────────────────────────
     input_data = add_sidebar(prefill=extracted_values)
 
     col1, col2 = st.columns([4, 1])
-
     with col1:
-        radar_chart = get_radar_chart(input_data)
-        st.plotly_chart(radar_chart)
-
+        st.plotly_chart(get_radar_chart(input_data))
     with col2:
         add_predictions(input_data)
 
