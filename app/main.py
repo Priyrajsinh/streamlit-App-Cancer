@@ -45,7 +45,7 @@ SLIDER_LABELS = [
 
 ALL_KEYS = [k for _, k in SLIDER_LABELS]
 
-# Map readable feature names (as they appear in the PDF table) to key prefixes
+# Maps lowercase feature name (as seen in PDF) → internal key prefix
 FEATURE_MAP = {
     "radius":            "radius",
     "texture":           "texture",
@@ -70,126 +70,119 @@ def get_clean_data():
     return data
 
 
-# ── PDF parsing (free, no API) ─────────────────────────────────────────────────
+# ── PDF parser (free, no API key) ──────────────────────────────────────────────
+
+def try_float(s):
+    """Return float if string is a valid number, else None."""
+    try:
+        return float(str(s).strip().replace(",", "."))
+    except (ValueError, TypeError):
+        return None
+
+
+def match_feature(cell_text):
+    """Return the internal key prefix if cell_text matches a known feature name."""
+    t = str(cell_text).strip().lower()
+    for fname, fkey in FEATURE_MAP.items():
+        if fname in t:
+            return fkey
+    return None
+
 
 def extract_measurements_from_pdf(file_bytes: bytes) -> dict:
     """
-    Parse all 30 FNA measurements directly from a PDF using pdfplumber.
-    Works with the standard report format generated for this app.
+    Parse all 30 FNA measurements from a PDF report.
+    Looks for a table whose rows are: Feature | Mean | SE | Worst
+    Also falls back to scanning raw text lines.
     """
     extracted = {}
 
     with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
         full_text = ""
-        all_tables = []
         for page in pdf.pages:
-            full_text += (page.extract_text() or "") + "\n"
-            tables = page.extract_tables()
-            if tables:
-                all_tables.extend(tables)
+            page_text = page.extract_text() or ""
+            full_text += page_text + "\n"
 
-    # ── Strategy 1: parse structured table rows ────────────────────────────
-    # Expected row format: ["Radius", "13.54000", "0.26990", "15.11000"]
-    number_re = re.compile(r"^\d+(\.\d+)?$")
+            # ── Strategy 1: structured table rows ─────────────────────────
+            for table in (page.extract_tables() or []):
+                for row in table:
+                    if not row or len(row) < 4:
+                        continue
 
-    for table in all_tables:
-        for row in table:
-            if not row or len(row) < 4:
+                    fkey = match_feature(row[0])
+                    if not fkey:
+                        continue
+
+                    # Collect all numeric cells (skip the first/feature cell)
+                    nums = [try_float(c) for c in row[1:] if try_float(c) is not None]
+                    if len(nums) >= 3:
+                        extracted[f"{fkey}_mean"]  = nums[0]
+                        extracted[f"{fkey}_se"]    = nums[1]
+                        extracted[f"{fkey}_worst"] = nums[2]
+
+    # ── Strategy 2: scan raw text lines ────────────────────────────────────
+    # Handles: "Radius 13.54000 0.26990 15.11000"
+    if len(extracted) < 10:
+        float_re = re.compile(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?")
+        for line in full_text.splitlines():
+            fkey = match_feature(line)
+            if not fkey:
                 continue
-            # Clean cells
-            cells = [str(c).strip().lower() if c else "" for c in row]
-            feature_name = cells[0]
+            nums = [float(x) for x in float_re.findall(line)]
+            if len(nums) >= 3 and f"{fkey}_mean" not in extracted:
+                extracted[f"{fkey}_mean"]  = nums[0]
+                extracted[f"{fkey}_se"]    = nums[1]
+                extracted[f"{fkey}_worst"] = nums[2]
 
-            # Match feature name
-            matched_key = None
-            for fname, fkey in FEATURE_MAP.items():
-                if fname in feature_name:
-                    matched_key = fkey
-                    break
-            if not matched_key:
-                continue
-
-            # Extract the three numeric columns (mean, se, worst)
-            nums = []
-            for cell in cells[1:]:
-                cell_clean = cell.replace(",", ".")
-                if number_re.match(cell_clean):
-                    nums.append(float(cell_clean))
-                elif re.match(r"^\d+(\.\d+)?$", cell_clean):
-                    nums.append(float(cell_clean))
-
-            if len(nums) >= 3:
-                extracted[f"{matched_key}_mean"]  = nums[0]
-                extracted[f"{matched_key}_se"]    = nums[1]
-                extracted[f"{matched_key}_worst"] = nums[2]
-
-    # ── Strategy 2: regex scan of raw text for key: value pairs ───────────
-    # Handles formats like "radius_mean: 13.54" or "radius_mean = 13.54"
+    # ── Strategy 3: key=value / key: value anywhere in text ────────────────
     if len(extracted) < 10:
         for key in ALL_KEYS:
+            if key in extracted:
+                continue
             pattern = re.compile(
-                rf"{re.escape(key)}\s*[=:]\s*([0-9]+(?:\.[0-9]+)?)",
+                rf"{re.escape(key)}\s*[=:]\s*([-+]?\d*\.?\d+)",
                 re.IGNORECASE,
             )
             m = pattern.search(full_text)
-            if m and key not in extracted:
+            if m:
                 extracted[key] = float(m.group(1))
-
-    # ── Strategy 3: scan for lines with "feature ... num num num" ─────────
-    if len(extracted) < 10:
-        lines = full_text.splitlines()
-        float_re = re.compile(r"\d+\.\d{3,}")
-        for line in lines:
-            line_low = line.lower()
-            matched_key = None
-            for fname, fkey in FEATURE_MAP.items():
-                if fname in line_low:
-                    matched_key = fkey
-                    break
-            if not matched_key:
-                continue
-            nums = [float(x) for x in float_re.findall(line)]
-            if len(nums) >= 3 and f"{matched_key}_mean" not in extracted:
-                extracted[f"{matched_key}_mean"]  = nums[0]
-                extracted[f"{matched_key}_se"]    = nums[1]
-                extracted[f"{matched_key}_worst"] = nums[2]
 
     return extracted
 
 
-# ── chart & prediction ─────────────────────────────────────────────────────────
+# ── chart ──────────────────────────────────────────────────────────────────────
 
 def get_scaled_values(input_dict):
     data = get_clean_data()
-    X = data.drop(["diagnosis"], axis=1)
-    scaled = {}
-    for key, value in input_dict.items():
-        max_val = X[key].max()
-        min_val = X[key].min()
-        scaled[key] = (value - min_val) / (max_val - min_val)
-    return scaled
+    X    = data.drop(["diagnosis"], axis=1)
+    return {
+        key: (val - X[key].min()) / (X[key].max() - X[key].min())
+        for key, val in input_dict.items()
+    }
 
 
 def get_radar_chart(input_data):
-    input_data = get_scaled_values(input_data)
+    scaled = get_scaled_values(input_data)
     categories = ["Radius","Texture","Perimeter","Area","Smoothness",
                   "Compactness","Concavity","Concave Points","Symmetry","Fractal Dimension"]
-    suffixes = {
-        "mean":  ["radius_mean","texture_mean","perimeter_mean","area_mean",
-                  "smoothness_mean","compactness_mean","concavity_mean",
-                  "concave points_mean","symmetry_mean","fractal_dimension_mean"],
-        "se":    ["radius_se","texture_se","perimeter_se","area_se",
-                  "smoothness_se","compactness_se","concavity_se",
-                  "concave points_se","symmetry_se","fractal_dimension_se"],
-        "worst": ["radius_worst","texture_worst","perimeter_worst","area_worst",
-                  "smoothness_worst","compactness_worst","concavity_worst",
-                  "concave points_worst","symmetry_worst","fractal_dimension_worst"],
+    groups = {
+        "Mean Value":     ["radius_mean","texture_mean","perimeter_mean","area_mean",
+                           "smoothness_mean","compactness_mean","concavity_mean",
+                           "concave points_mean","symmetry_mean","fractal_dimension_mean"],
+        "Standard Error": ["radius_se","texture_se","perimeter_se","area_se",
+                           "smoothness_se","compactness_se","concavity_se",
+                           "concave points_se","symmetry_se","fractal_dimension_se"],
+        "Worst Value":    ["radius_worst","texture_worst","perimeter_worst","area_worst",
+                           "smoothness_worst","compactness_worst","concavity_worst",
+                           "concave points_worst","symmetry_worst","fractal_dimension_worst"],
     }
     fig = go.Figure()
-    for group, label in [("mean","Mean Value"),("se","Standard Error"),("worst","Worst Value")]:
+    for label, keys in groups.items():
         fig.add_trace(go.Scatterpolar(
-            r=[input_data[k] for k in suffixes[group]],
-            theta=categories, fill="toself", name=label,
+            r=[scaled[k] for k in keys],
+            theta=categories,
+            fill="toself",
+            name=label,
         ))
     fig.update_layout(
         polar=dict(radialaxis=dict(visible=True, range=[0, 1])),
@@ -198,19 +191,20 @@ def get_radar_chart(input_data):
     return fig
 
 
+# ── prediction ─────────────────────────────────────────────────────────────────
+
 def add_predictions(input_data):
     model  = pkl.load(open("model/model.pkl",  "rb"))
     scaler = pkl.load(open("model/scaler.pkl", "rb"))
 
-    input_array        = np.array(list(input_data.values())).reshape(1, -1)
-    input_array_scaled = scaler.transform(input_array)
-    prediction         = model.predict(input_array_scaled)[0]
-    proba              = model.predict_proba(input_array_scaled)[0]
+    arr    = np.array(list(input_data.values())).reshape(1, -1)
+    arr_sc = scaler.transform(arr)
+    pred   = model.predict(arr_sc)[0]
+    proba  = model.predict_proba(arr_sc)[0]
 
     st.subheader("Cell Cluster Prediction")
     st.write("The cell cluster is:")
-
-    if prediction == 0:
+    if pred == 0:
         st.write("<span class='diagnosis benign'>Benign</span>", unsafe_allow_html=True)
     else:
         st.write("<span class='diagnosis malicious'>Malignant</span>", unsafe_allow_html=True)
@@ -257,12 +251,11 @@ def main():
         "You can also adjust values manually using the sidebar sliders."
     )
 
-    # ── Upload section ─────────────────────────────────────────────────────
     st.subheader("📄 Upload Lab Report (PDF)")
     uploaded_file = st.file_uploader(
         "Upload a cytology PDF report",
         type=["pdf"],
-        help="The app will read the PDF and fill in all 30 measurements automatically — no API key required.",
+        help="The app reads the PDF directly — no API key or internet connection required.",
     )
 
     extracted_values = None
@@ -272,12 +265,11 @@ def main():
         with st.spinner("📖 Reading your report..."):
             try:
                 extracted_values = extract_measurements_from_pdf(file_bytes)
-
                 missing = [k for k in ALL_KEYS if k not in extracted_values]
                 found   = len(ALL_KEYS) - len(missing)
 
                 if found == len(ALL_KEYS):
-                    st.success(f"✅ All 30 measurements extracted successfully!")
+                    st.success("✅ All 30 measurements extracted successfully!")
                 elif found > 0:
                     st.warning(
                         f"⚠️ Extracted {found}/30 measurements. "
@@ -285,22 +277,21 @@ def main():
                     )
                 else:
                     st.error(
-                        "❌ Could not extract measurements. "
-                        "Make sure the PDF has a measurements table with Feature / Mean / SE / Worst columns."
+                        "❌ Could not extract measurements from this PDF. "
+                        "Please make sure it contains a table with Feature, Mean, SE and Worst columns, "
+                        "or use the sidebar sliders to enter values manually."
                     )
                     extracted_values = None
 
-                # Fill missing with dataset means
                 if extracted_values is not None:
                     data = get_clean_data()
                     for k in missing:
                         extracted_values[k] = float(data[k].mean())
 
             except Exception as e:
-                st.error(f"❌ Error reading report: {e}")
+                st.error(f"❌ Error reading PDF: {e}")
                 extracted_values = None
 
-    # ── Sliders & chart ────────────────────────────────────────────────────
     input_data = add_sidebar(prefill=extracted_values)
 
     col1, col2 = st.columns([4, 1])
