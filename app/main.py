@@ -3,24 +3,10 @@ import pickle as pkl
 import pandas as pd
 import plotly.graph_objects as go
 import numpy as np
+from pypdf import PdfReader
 import re
 import io
 
-# Try pdfplumber first, fall back to pypdf
-try:
-    import pdfplumber
-    HAS_PDFPLUMBER = True
-except ImportError:
-    HAS_PDFPLUMBER = False
-
-try:
-    from pypdf import PdfReader
-    HAS_PYPDF = True
-except ImportError:
-    HAS_PYPDF = False
-
-
-# ── constants ──────────────────────────────────────────────────────────────────
 
 SLIDER_LABELS = [
     ("Radius (mean)",             "radius_mean"),
@@ -70,10 +56,10 @@ FEATURE_MAP = {
     "fractal dimension": "fractal_dimension",
 }
 
-FLOAT_RE = re.compile(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?")
+# Matches a standalone number (possibly decimal / scientific notation)
+SOLO_FLOAT_RE = re.compile(r"^[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?$")
+ANY_FLOAT_RE  = re.compile(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?")
 
-
-# ── helpers ────────────────────────────────────────────────────────────────────
 
 @st.cache_data
 def get_clean_data():
@@ -83,61 +69,78 @@ def get_clean_data():
     return data
 
 
-def extract_text_from_pdf(file_bytes: bytes) -> str:
-    """Extract all text from a PDF using whatever library is available."""
-    text = ""
-
-    # Try pdfplumber first (better at tables)
-    if HAS_PDFPLUMBER:
-        try:
-            with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-                for page in pdf.pages:
-                    text += (page.extract_text() or "") + "\n"
-            if text.strip():
-                return text
-        except Exception:
-            pass
-
-    # Fall back to pypdf
-    if HAS_PYPDF:
-        try:
-            reader = PdfReader(io.BytesIO(file_bytes))
-            for page in reader.pages:
-                text += (page.extract_text() or "") + "\n"
-        except Exception:
-            pass
-
-    return text
-
-
-def parse_measurements(text: str) -> dict:
+def extract_measurements_from_pdf(file_bytes: bytes) -> dict:
     """
-    Parse 30 FNA measurements from raw PDF text.
-    Handles two line formats:
-      1. "radius: 13.54 0.2699 15.11"          (colon-separated)
-      2. "Radius 13.54000 0.26990 15.11000"     (space-separated)
+    Handles two PDF layouts produced by different PDF renderers:
+      Layout A (pdfplumber / some renderers):
+          Radius 13.54000 0.26990 15.11000   <- all on one line
+      Layout B (pypdf / Streamlit Cloud):
+          Radius
+          13.54000
+          0.26990
+          15.11000                           <- values on separate lines
     """
     extracted = {}
-    for line in text.splitlines():
-        line_low = line.strip().lower()
+
+    reader = PdfReader(io.BytesIO(file_bytes))
+    full_text = ""
+    for page in reader.pages:
+        full_text += (page.extract_text() or "") + "\n"
+
+    lines = [l.strip() for l in full_text.splitlines()]
+
+    i = 0
+    while i < len(lines):
+        line_low = lines[i].lower()
+
+        # Try to match this line to a known feature name
+        matched_key = None
         for fname, fkey in FEATURE_MAP.items():
-            # Match line that starts with the feature name
-            if line_low.startswith(fname):
-                nums = [float(x) for x in FLOAT_RE.findall(line)]
-                if len(nums) >= 3:
-                    extracted[f"{fkey}_mean"]  = nums[0]
-                    extracted[f"{fkey}_se"]    = nums[1]
-                    extracted[f"{fkey}_worst"] = nums[2]
+            if line_low == fname or line_low.startswith(fname + " "):
+                matched_key = fkey
                 break
+
+        if not matched_key:
+            i += 1
+            continue
+
+        # --- Layout A: numbers on the same line as the feature name ---
+        # Strip the feature name text and grab remaining numbers
+        feature_text_len = len(matched_key.replace("_", " "))
+        rest = lines[i][feature_text_len:]
+        nums_same = [float(x) for x in ANY_FLOAT_RE.findall(rest)]
+
+        if len(nums_same) >= 3:
+            extracted[f"{matched_key}_mean"]  = nums_same[0]
+            extracted[f"{matched_key}_se"]    = nums_same[1]
+            extracted[f"{matched_key}_worst"] = nums_same[2]
+            i += 1
+            continue
+
+        # --- Layout B: numbers on subsequent lines ---
+        nums_next = []
+        j = i + 1
+        while j < len(lines) and len(nums_next) < 3:
+            if lines[j] == "":
+                j += 1
+                continue
+            if SOLO_FLOAT_RE.match(lines[j]):
+                nums_next.append(float(lines[j]))
+                j += 1
+            else:
+                break  # hit a non-numeric line — stop looking
+
+        if len(nums_next) >= 3:
+            extracted[f"{matched_key}_mean"]  = nums_next[0]
+            extracted[f"{matched_key}_se"]    = nums_next[1]
+            extracted[f"{matched_key}_worst"] = nums_next[2]
+            i = j
+            continue
+
+        i += 1
+
     return extracted
 
-
-def extract_measurements_from_pdf(file_bytes: bytes) -> dict:
-    text = extract_text_from_pdf(file_bytes)
-    return parse_measurements(text)
-
-
-# ── chart ──────────────────────────────────────────────────────────────────────
 
 def get_scaled_values(input_dict):
     data = get_clean_data()
@@ -154,16 +157,16 @@ def get_radar_chart(input_data):
                   "Compactness", "Concavity", "Concave Points", "Symmetry", "Fractal Dimension"]
     groups = {
         "Mean Value": [
-            "radius_mean","texture_mean","perimeter_mean","area_mean","smoothness_mean",
-            "compactness_mean","concavity_mean","concave points_mean","symmetry_mean","fractal_dimension_mean",
+            "radius_mean", "texture_mean", "perimeter_mean", "area_mean", "smoothness_mean",
+            "compactness_mean", "concavity_mean", "concave points_mean", "symmetry_mean", "fractal_dimension_mean",
         ],
         "Standard Error": [
-            "radius_se","texture_se","perimeter_se","area_se","smoothness_se",
-            "compactness_se","concavity_se","concave points_se","symmetry_se","fractal_dimension_se",
+            "radius_se", "texture_se", "perimeter_se", "area_se", "smoothness_se",
+            "compactness_se", "concavity_se", "concave points_se", "symmetry_se", "fractal_dimension_se",
         ],
         "Worst Value": [
-            "radius_worst","texture_worst","perimeter_worst","area_worst","smoothness_worst",
-            "compactness_worst","concavity_worst","concave points_worst","symmetry_worst","fractal_dimension_worst",
+            "radius_worst", "texture_worst", "perimeter_worst", "area_worst", "smoothness_worst",
+            "compactness_worst", "concavity_worst", "concave points_worst", "symmetry_worst", "fractal_dimension_worst",
         ],
     }
     fig = go.Figure()
@@ -180,8 +183,6 @@ def get_radar_chart(input_data):
     )
     return fig
 
-
-# ── prediction ─────────────────────────────────────────────────────────────────
 
 def add_predictions(input_data):
     model  = pkl.load(open("model/model.pkl",  "rb"))
@@ -202,8 +203,6 @@ def add_predictions(input_data):
     st.info("This app assists medical professionals but should not replace professional medical advice.")
 
 
-# ── sidebar ────────────────────────────────────────────────────────────────────
-
 def add_sidebar(prefill=None):
     st.sidebar.header("Cell Nuclei Measurements")
     data = get_clean_data()
@@ -218,8 +217,6 @@ def add_sidebar(prefill=None):
         )
     return input_dict
 
-
-# ── main ───────────────────────────────────────────────────────────────────────
 
 def main():
     st.set_page_config(
