@@ -5,3 +5,4 @@ pandas
 scikit-learn
 plotly>=5.18.0
 pdfplumber
+pypdf
