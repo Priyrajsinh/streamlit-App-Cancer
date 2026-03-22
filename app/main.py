@@ -3,9 +3,20 @@ import pickle as pkl
 import pandas as pd
 import plotly.graph_objects as go
 import numpy as np
-from pypdf import PdfReader
 import re
 import io
+
+try:
+    import pdfplumber
+    HAS_PDFPLUMBER = True
+except ImportError:
+    HAS_PDFPLUMBER = False
+
+try:
+    from pypdf import PdfReader
+    HAS_PYPDF = True
+except ImportError:
+    HAS_PYPDF = False
 
 
 SLIDER_LABELS = [
@@ -56,9 +67,7 @@ FEATURE_MAP = {
     "fractal dimension": "fractal_dimension",
 }
 
-# Matches a standalone number (possibly decimal / scientific notation)
-SOLO_FLOAT_RE = re.compile(r"^[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?$")
-ANY_FLOAT_RE  = re.compile(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?")
+FLOAT_RE = re.compile(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?")
 
 
 @st.cache_data
@@ -69,76 +78,45 @@ def get_clean_data():
     return data
 
 
-def extract_measurements_from_pdf(file_bytes: bytes) -> dict:
-    """
-    Handles two PDF layouts produced by different PDF renderers:
-      Layout A (pdfplumber / some renderers):
-          Radius 13.54000 0.26990 15.11000   <- all on one line
-      Layout B (pypdf / Streamlit Cloud):
-          Radius
-          13.54000
-          0.26990
-          15.11000                           <- values on separate lines
-    """
+def extract_text_from_pdf(file_bytes: bytes):
+    """Returns (text, method_used)"""
+    if HAS_PDFPLUMBER:
+        try:
+            text = ""
+            with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+                for page in pdf.pages:
+                    text += (page.extract_text() or "") + "\n"
+            if text.strip():
+                return text, "pdfplumber"
+        except Exception as e:
+            pass
+
+    if HAS_PYPDF:
+        try:
+            text = ""
+            reader = PdfReader(io.BytesIO(file_bytes))
+            for page in reader.pages:
+                text += (page.extract_text() or "") + "\n"
+            if text.strip():
+                return text, "pypdf"
+        except Exception as e:
+            pass
+
+    return "", "none"
+
+
+def parse_measurements(text: str) -> dict:
     extracted = {}
-
-    reader = PdfReader(io.BytesIO(file_bytes))
-    full_text = ""
-    for page in reader.pages:
-        full_text += (page.extract_text() or "") + "\n"
-
-    lines = [l.strip() for l in full_text.splitlines()]
-
-    i = 0
-    while i < len(lines):
-        line_low = lines[i].lower()
-
-        # Try to match this line to a known feature name
-        matched_key = None
+    for line in text.splitlines():
+        line_low = line.strip().lower()
         for fname, fkey in FEATURE_MAP.items():
-            if line_low == fname or line_low.startswith(fname + " "):
-                matched_key = fkey
+            if line_low.startswith(fname):
+                nums = [float(x) for x in FLOAT_RE.findall(line)]
+                if len(nums) >= 3:
+                    extracted[f"{fkey}_mean"]  = nums[0]
+                    extracted[f"{fkey}_se"]    = nums[1]
+                    extracted[f"{fkey}_worst"] = nums[2]
                 break
-
-        if not matched_key:
-            i += 1
-            continue
-
-        # --- Layout A: numbers on the same line as the feature name ---
-        # Strip the feature name text and grab remaining numbers
-        feature_text_len = len(matched_key.replace("_", " "))
-        rest = lines[i][feature_text_len:]
-        nums_same = [float(x) for x in ANY_FLOAT_RE.findall(rest)]
-
-        if len(nums_same) >= 3:
-            extracted[f"{matched_key}_mean"]  = nums_same[0]
-            extracted[f"{matched_key}_se"]    = nums_same[1]
-            extracted[f"{matched_key}_worst"] = nums_same[2]
-            i += 1
-            continue
-
-        # --- Layout B: numbers on subsequent lines ---
-        nums_next = []
-        j = i + 1
-        while j < len(lines) and len(nums_next) < 3:
-            if lines[j] == "":
-                j += 1
-                continue
-            if SOLO_FLOAT_RE.match(lines[j]):
-                nums_next.append(float(lines[j]))
-                j += 1
-            else:
-                break  # hit a non-numeric line — stop looking
-
-        if len(nums_next) >= 3:
-            extracted[f"{matched_key}_mean"]  = nums_next[0]
-            extracted[f"{matched_key}_se"]    = nums_next[1]
-            extracted[f"{matched_key}_worst"] = nums_next[2]
-            i = j
-            continue
-
-        i += 1
-
     return extracted
 
 
@@ -153,20 +131,20 @@ def get_scaled_values(input_dict):
 
 def get_radar_chart(input_data):
     scaled = get_scaled_values(input_data)
-    categories = ["Radius", "Texture", "Perimeter", "Area", "Smoothness",
-                  "Compactness", "Concavity", "Concave Points", "Symmetry", "Fractal Dimension"]
+    categories = ["Radius","Texture","Perimeter","Area","Smoothness",
+                  "Compactness","Concavity","Concave Points","Symmetry","Fractal Dimension"]
     groups = {
         "Mean Value": [
-            "radius_mean", "texture_mean", "perimeter_mean", "area_mean", "smoothness_mean",
-            "compactness_mean", "concavity_mean", "concave points_mean", "symmetry_mean", "fractal_dimension_mean",
+            "radius_mean","texture_mean","perimeter_mean","area_mean","smoothness_mean",
+            "compactness_mean","concavity_mean","concave points_mean","symmetry_mean","fractal_dimension_mean",
         ],
         "Standard Error": [
-            "radius_se", "texture_se", "perimeter_se", "area_se", "smoothness_se",
-            "compactness_se", "concavity_se", "concave points_se", "symmetry_se", "fractal_dimension_se",
+            "radius_se","texture_se","perimeter_se","area_se","smoothness_se",
+            "compactness_se","concavity_se","concave points_se","symmetry_se","fractal_dimension_se",
         ],
         "Worst Value": [
-            "radius_worst", "texture_worst", "perimeter_worst", "area_worst", "smoothness_worst",
-            "compactness_worst", "concavity_worst", "concave points_worst", "symmetry_worst", "fractal_dimension_worst",
+            "radius_worst","texture_worst","perimeter_worst","area_worst","smoothness_worst",
+            "compactness_worst","concavity_worst","concave points_worst","symmetry_worst","fractal_dimension_worst",
         ],
     }
     fig = go.Figure()
@@ -249,7 +227,18 @@ def main():
         file_bytes = uploaded_file.read()
         with st.spinner("📖 Reading your report..."):
             try:
-                extracted_values = extract_measurements_from_pdf(file_bytes)
+                text, method = extract_text_from_pdf(file_bytes)
+
+                # ── DEBUG expander — shows raw extracted text ──────────────
+                with st.expander("🔍 Debug: raw text extracted from PDF"):
+                    st.write(f"**Parser used:** `{method}`")
+                    st.write(f"**pdfplumber available:** `{HAS_PDFPLUMBER}`")
+                    st.write(f"**pypdf available:** `{HAS_PYPDF}`")
+                    st.write(f"**Total characters extracted:** `{len(text)}`")
+                    st.text(text[:3000] if text else "⚠️ No text extracted at all")
+                # ─────────────────────────────────────────────────────────────
+
+                extracted_values = parse_measurements(text)
                 missing = [k for k in ALL_KEYS if k not in extracted_values]
                 found   = len(ALL_KEYS) - len(missing)
 
@@ -258,12 +247,12 @@ def main():
                 elif found > 0:
                     st.warning(
                         f"⚠️ Extracted {found}/30 measurements. "
-                        f"Missing values will use dataset averages: {', '.join(missing)}"
+                        f"Missing: {', '.join(missing)}"
                     )
                 else:
                     st.error(
-                        "❌ Could not read measurements from this PDF. "
-                        "Please use the sidebar sliders to enter values manually."
+                        "❌ Could not read measurements. "
+                        "Please expand the Debug section above and share a screenshot — that will help fix the issue."
                     )
                     extracted_values = None
 
@@ -273,7 +262,7 @@ def main():
                         extracted_values[k] = float(data[k].mean())
 
             except Exception as e:
-                st.error(f"❌ Error reading PDF: {e}")
+                st.error(f"❌ Error: {e}")
                 extracted_values = None
 
     input_data = add_sidebar(prefill=extracted_values)
